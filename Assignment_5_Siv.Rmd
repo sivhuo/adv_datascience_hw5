@@ -1,0 +1,357 @@
+---
+title: 'Assignment #5'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r libraries}
+# SEE modeldata package for new datasets
+library(tidyverse)         # for graphing and data cleaning
+library(tidymodels)        # for modeling
+library(ranger)            # for random forest - will need for shiny app
+library(lubridate)         # for date manipulation
+library(themis)            # for up and downsampling
+library(DALEX)             # for model interpretation  
+library(DALEXtra)          # for extension of DALEX
+library(patchwork)         # for combining plots nicely
+theme_set(theme_minimal()) # Lisa's favorite theme
+data("lending_club")
+# Data dictionary (as close as I could find): https://www.kaggle.com/wordsforthewise/lending-club/discussion/170691
+```
+
+## Interpretable ML methods
+
+```{r}
+set.seed(494) # for reproducibility
+
+#split data
+lending_split <- initial_split(lending_club,
+                               prop = .75,
+                               strata = Class)
+
+lending_training <- training(lending_split)
+lending_test <- testing(lending_split)
+
+
+#create recipe - including up and downsampling for model fitting
+set.seed(456)
+rf_recipe <- 
+  recipe(Class ~ .,
+         data = lending_training) %>% 
+  step_upsample(Class, over_ratio = .5) %>% 
+  step_downsample(Class, under_ratio = 1) %>% 
+  step_mutate_at(all_numeric(), 
+                 fn = ~as.numeric(.))
+
+# create model
+rf_model <- 
+  rand_forest(mtry = tune(), 
+              min_n = tune(), 
+              trees = 100) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+
+# create workflow
+rf_workflow <-
+  workflow() %>% 
+  add_recipe(rf_recipe) %>% 
+  add_model(rf_model)
+
+  grid_regular(finalize(mtry(),
+                        lending_training %>%
+                          select(-Class)),
+               min_n(),
+               levels = 3)
+```
+
+```{r}
+# create penalty grid
+rf_penalty_grid <- 
+grid_regular(finalize(mtry(),
+                        lending_training %>%
+                          select(-Class)),
+               min_n(),
+               levels = 3)
+
+
+# create cv samples
+set.seed(494) #for reproducible 5-fold
+lending_cv <- vfold_cv(lending_training,
+                       v = 5)
+
+# tune model
+rf_tune <- 
+  rf_workflow %>% 
+  tune_grid(
+    resamples = lending_cv,
+    grid = rf_penalty_grid
+  )
+
+# find model with best accuracy
+best_accuracy <-
+  rf_tune %>% 
+  select_best(metric = "accuracy")
+
+# finalize model
+rf_final <- rf_workflow %>% 
+  finalize_workflow(best_accuracy) %>% 
+  fit(data = lending_training)
+
+```
+
+1. Use functions from the `DALEX` and `DALEXtra` libraries to create a histogram and boxplot of the residuals from the training data. How do they look? Any interesting behavior?
+
+```{r}
+rf_explain <- 
+  explain_tidymodels(
+    model = rf_final,
+    data = lending_training %>% select(-Class), 
+    y = lending_training %>% 
+      mutate(Class_num = as.integer(Class =="good")) %>% 
+      pull(Class_num),
+    label = "rf"
+  )
+```
+```{r}
+rf_mod_perf <- model_performance(rf_explain)
+```
+
+```{r}
+hist_plot <- 
+  plot(rf_mod_perf, 
+       geom = "histogram")
+box_plot <-
+  plot(rf_mod_perf, 
+       geom = "boxplot")
+
+hist_plot + box_plot
+```
+
+This histogram for residuals is right-skewed showing that most predictions have small residuals between 0 and 0.2 but if we look closely there are also outliers that have residuals up to 0.6. Similarly for boxplot, most residuals lie between 0 and 0.2, but outiers' residuals can also go up to 0.6. 
+
+2. Use DALEX functions to create a variable importance plot from this model. What are the most important variables?
+
+```{r}
+set.seed(10)
+rf_var_imp <- 
+  model_parts(
+    rf_explain
+    )
+
+plot(rf_var_imp, show_boxplots = TRUE)
+```
+
+The most important variables are int_rate, sub_grade, and open_il_24m. 
+
+3. Write a function called cp_profile to make a CP profile. The function will take an explainer, a new observation, and a variable name as its arguments and create a CP profile for a quantitative predictor variable. You will need to use the predict_profile() function inside the function you create - put the variable name there so the plotting part is easier. You’ll also want to use .data[[]] rather than aes() and quote the variables. Use the cp_profile() function to create one CP profile of your choosing. Be sure to choose a variable that is numeric, not integer. There seem to be issues with those that I’m looking into.
+
+```{r}
+#Create a cp_profile function 
+cp_profile <- function(explainer, new_obs, variable){
+  rf_cpp <- predict_profile(explainer = explainer,
+                            variables = variable,
+                            new_observation = new_obs) 
+  plot <- rf_cpp %>% 
+  filter(`_vname_` %in% c(variable)) %>% 
+  ggplot(aes(x = .data[[variable]],
+             y = `_yhat_`)) +
+  geom_line()
+  return(plot)
+}
+```
+
+```{r}
+obs4 <- lending_training %>% slice(4)
+cp_profile(rf_explain, obs4, "int_rate")
+```
+
+
+4. Use DALEX functions to create partial dependence plots (with the CP profiles in gray) for the 3-4 most important variables. If the important variables are categorical, you can instead make a CP profile for 3 observations in the dataset and discuss how you could go about constructing a partial dependence plot for a categorical variable (you don’t have to code it, but you can if you want an extra challenge). If it ever gives you an error that says, “Error: Can’t convert from VARIABLE to VARIABLE due to loss of precision”, then remove that variable from the list. I seem to have figured out why it’s doing that, but I don’t know how to fix it yet.
+
+```{r}
+set.seed(494)
+
+rf_pdp1 <- model_profile(explainer = rf_explain,
+                         variables = c("int_rate"))
+
+plot(rf_pdp1, 
+     variables = "int_rate",
+     geom = "profiles")
+```
+
+```{r}
+rf_pdp2 <- model_profile(explainer = rf_explain,
+                         variables = c("sub_grade"))
+
+plot(rf_pdp2, 
+     variables = "sub_grade",
+     geom = "profiles")
+```
+
+```{r}
+rf_pdp3 <- model_profile(explainer = rf_explain,
+                         variables = c("open_il_24m"))
+
+plot(rf_pdp3, 
+     variables = "open_il_24m",
+     geom = "profiles")
+```
+
+5. Choose 3 observations and do the following for each observation:
+Construct a break-down plot using the default ordering. Interpret the resulting graph. Which variables contribute most to each observation’s prediction?
+Construct a SHAP graph and interpret it. Does it tell a similar story to the break-down plot?
+Construct a LIME graph (follow my code carefully). How close is each original prediction to the prediction from the local model? Interpret the result. You can also try using fewer or more variables in the local model than I used in the example.
+
+#### Observation 1000
+
+```{r}
+obs1000 <- lending_test %>% slice(1000) 
+
+pp1000 <- predict_parts(explainer = rf_explain,
+                        new_observation = obs1000,
+                        type = "break_down")
+plot(pp1000)
+```
+
+Looking at the break down profile, we can see that 0.848 is the average predicted Class when we applied rf model to the training data. Three variables that contribute the most to observation1000's prediction are int_rate (19.99), sub_grade (21), and num_il_tl (4). As we can see, if we fix the int rate = 19.99, the average prediction decreases by 0.068. For sub_grade = 21, it decreases by 0.072 and for num_il_tl = 4, it decreases by 0.3. 
+
+```{r}
+rf_shap1000 <-predict_parts(explainer = rf_explain,
+                            new_observation = obs1000,
+                            type = "shap",
+                            B = 10)
+
+plot(rf_shap1000)
+```
+
+Based on the shap graph above, we can see that int_rate = 19.99 contribute about 0.06 decrease to the predicted Class. The boxplot seems to show a large variation but the effect is still negative. It is just that we are less confident in its exact effect to the predicted class. Two other important variables are sub_grade = E1 and total_il_high_credit_limit = 28430. These two are different from the break down profile. 
+
+```{r}
+set.seed(2)
+
+model_type.dalex_explainer <- DALEXtra::model_type.dalex_explainer
+predict_model.dalex_explainer <- DALEXtra::predict_model.dalex_explainer
+
+lime_rf <- predict_surrogate(explainer = rf_explain,
+                             new_observation = obs1000 %>%
+                               select(-Class), 
+                             n_features = 5,
+                             n_permutations = 1000,
+                             type = "lime")
+
+plot(lime_rf) +
+  labs(x = "Variable")
+```
+
+From this graph, we can see that the predicted value from the original random forest is about 0.735. The explanation fit shows that the model_r2 is about 0.12. We also observe that int > 15.31 has the largest negative effect showing that it is the most important in the local model. 
+
+#### Observation 5 
+
+```{r}
+obs5 <- lending_test %>% slice(5) 
+
+pp5 <- predict_parts(explainer = rf_explain,
+                     new_observation = obs5,
+                     type = "break_down")
+plot(pp5)
+
+```
+
+Looking at the break down profile, we can see that 0.848 is the average predicted Class when we applied rf model to the training data. Three variables that contribute the most to observation5's prediction are inq_last_6mths = 2, funded_amnt = 7000, and addr_state = 5. As we can see, if we fix the inq_last_6mths = 2, the average prediction decreases by 0.015. For funded_amnt = 7000, it decreases by 0.01 and for addr_state = 5, it decreases by 0.008. 
+
+```{r}
+rf_shap5 <-predict_parts(explainer = rf_explain,
+                         new_observation = obs5,
+                         type = "shap",
+                         B = 10)
+
+plot(rf_shap5)
+```
+
+Based on the shap graph above, we can see that inq_last_6mths = 2 contribute about 0.012 decrease to the predicted Class. Even though the boxplot seems to show a large variation but the effect is still negative. Two other important variables are total_bal_il = 7203 and addr_state = CA. 
+
+```{r}
+set.seed(2)
+
+model_type.dalex_explainer <- DALEXtra::model_type.dalex_explainer
+predict_model.dalex_explainer <- DALEXtra::predict_model.dalex_explainer
+
+lime_rf <- predict_surrogate(explainer = rf_explain,
+                             new_observation = obs5 %>%
+                               select(-Class), 
+                             n_features = 5,
+                             n_permutations = 1000,
+                             type = "lime")
+
+plot(lime_rf) +
+  labs(x = "Variable")
+```
+
+From this graph, we can see that the predicted value from the original random forest is about 0.94. The explanation fit shows that the model_r2 is about 0.032. We also observe that inq_last_6mths > 1 has the largest negative effect on the prediction, showing that it is the most important in the local model. 
+
+#### Observation 50
+
+```{r}
+obs40 <- lending_test %>% slice(40)
+
+pp40 <- predict_parts(explainer = rf_explain,
+                      new_observation = obs40,
+                      type = "break_down")
+plot(pp40)
+```
+
+Looking at the break down profile, we can see that 0.848 is the average predicted Class when we applied rf model to the training data. Three variables that contribute the most to observation50's prediction are funded_amnt = 9825, all_util = 51, and open_il_6m = 4. As we can see, if we fix the funded_amnt = 9825, the average prediction decreases by 0.035. For all_util = 51, it decreases by 0.012 and for open_il_6m = 4, it decreases by 0.006. 
+
+```{r}
+rf_shap40 <-predict_parts(explainer = rf_explain,
+                          new_observation = obs40,
+                          type = "shap",
+                          B = 10)
+
+plot(rf_shap40)
+```
+
+Based on the shap graph above, we can see that inq_last_6mths = 2 contribute about 0.012 decrease to the predicted Class. Even though the boxplot seems to show a large variation but the effect is still negative. Two other important variables are total_bal_il = 7203 and addr_state = CA. 
+
+```{r}
+set.seed(2)
+
+model_type.dalex_explainer <- DALEXtra::model_type.dalex_explainer
+predict_model.dalex_explainer <- DALEXtra::predict_model.dalex_explainer
+
+lime_rf <- predict_surrogate(explainer = rf_explain,
+                             new_observation = obs40 %>%
+                               select(-Class), 
+                             n_features = 5,
+                             n_permutations = 1000,
+                             type = "lime")
+
+plot(lime_rf) +
+  labs(x = "Variable")
+```
+
+From this graph, we can see that the predicted value from the original random forest is about 0.94. The explanation fit shows that the model_r2 is about 0.032. We also observe that inq_last_6mths > 1 has the largest negative effect on the prediction, showing that it is the most important in the local model. 
+
+6. Describe how you would use the interpretable machine learning tools we’ve learned (both local and global) in future machine learning projects? How does each of them help you?
+
+I would use global interpretable machine learning tools to evaluate the overall performance of the machine learning models because these tools can help me find the most important variables and get a good insight of their residuals. Whereas, the local variable interpretable machine learning tools can be used to find the specific values of each variable that have a larger effect on the predictions. And we can take a deeper look at these special variables. 
+
+7. Save this final model using the write_rds() function - see the Use the model section of the tidymodels intro for a similar example, but we’re using write_rds() instead of saveRDS(). We are going to use the model in the next part. You’ll want to save it in the folder where you create your shiny app. Run the code, and then add eval=FALSE to the code chunk options (next to the r inside the curly brackets) so it doesn’t rerun this each time you knit.
+
+```{r eval=FALSE}
+write_rds(rf_final, "rf_final.rds")
+```
+
+## GitHub
+https://github.com/sivhuo/adv_datascience_hw5
+
+
+
